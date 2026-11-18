@@ -133,6 +133,20 @@ def main() -> None:
         help="Run every sub-step even when there are no open trades and no entry signal "
              "(only matters for strategies with side effects in bot_loop_start).",
     )
+    p.add_argument(
+        "--no-ui", action="store_true",
+        help="Do not start the in-process FreqUI live view (on by default when "
+             "config.json has an api_server section with username/password).",
+    )
+    p.add_argument(
+        "--ui-port", type=int, default=None,
+        help="Container port for the FreqUI live view (default: api_server.listen_port).",
+    )
+    p.add_argument(
+        "--exit-when-done", action="store_true",
+        help="Exit as soon as the replay finishes instead of keeping FreqUI up "
+             "for browsing the results.",
+    )
 
     args = p.parse_args()
     if args.workers < 1:
@@ -166,6 +180,9 @@ def main() -> None:
         sub_step=sub_step_secs,
         workers=args.workers,
         skip_idle=not args.no_skip_idle,
+        ui=not args.no_ui,
+        ui_port=args.ui_port,
+        exit_when_done=args.exit_when_done,
     )
 
 

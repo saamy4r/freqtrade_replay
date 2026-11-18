@@ -27,12 +27,15 @@ whatever is missing into `user_data/data/` on the first run.
 From the folder that contains `user_data/`:
 
 ```bash
-docker run --rm \
+docker run --rm -it -p 127.0.0.1:8082:8080 \
   -v "$PWD/user_data:/freqtrade/user_data" \
   ghcr.io/saamy4r/freqtrade-replay:latest \
   --strategy MyStrategy \
   --timerange 20250101-20250201
 ```
+
+While it runs, you can watch it in FreqUI at <http://127.0.0.1:8082>
+(see [Watch the replay live in FreqUI](#watch-the-replay-live-in-frequi)).
 
 When the run finishes, a summary is printed:
 
@@ -53,14 +56,16 @@ Add this service to the `docker-compose.yml` next to your `user_data/` folder:
     image: ghcr.io/saamy4r/freqtrade-replay:latest
     volumes:
       - "./user_data:/freqtrade/user_data"
+    ports:
+      - "127.0.0.1:8082:8080"   # FreqUI live view
     profiles:
       - replay
 ```
 
-and run:
+and run (`--service-ports` is needed, `run` doesn't publish ports otherwise):
 
 ```bash
-docker compose --profile replay run --rm replay \
+docker compose --profile replay run --rm --service-ports replay \
   --strategy MyStrategy \
   --timerange 20250101-20250201
 ```
@@ -93,6 +98,9 @@ Add any of these after the image name, or after `replay` with Compose:
 | `--no-fresh` | off | Keep the existing replay DB instead of starting clean |
 | `--report` | off | Also write an HTML report (equity curve + P&L per pair) |
 | `--no-skip-idle` | off | Run every sub-step even when nothing can trade |
+| `--no-ui` | off | Don't start the FreqUI live view |
+| `--ui-port` | `api_server.listen_port` | Port of the FreqUI live view inside the container |
+| `--exit-when-done` | off | Exit when the replay finishes instead of keeping FreqUI up |
 
 Paths are paths inside the container, where your `user_data` folder is
 `/freqtrade/user_data`. For example, to get an HTML report in your `user_data`
@@ -104,10 +112,33 @@ folder:
 
 ---
 
-## View results in FreqUI
+## Watch the replay live in FreqUI
 
-The replay database is a normal freqtrade database. To browse it in FreqUI, start
-a regular freqtrade bot on it after the replay has finished:
+FreqUI runs **inside the replay process**, so there is no second container to
+start. Publish the port (`-p 127.0.0.1:8082:8080`, or `--service-ports` with
+Compose), open <http://127.0.0.1:8082> and log in with the `username` /
+`password` from the `api_server` section of your `config.json`.
+
+Because FreqUI talks to the replay bot directly, everything it shows is at
+**replay time**: charts end at the current replay candle, and open trades show
+their unrealized P&L up to the replay's "now", not today's date. The Cumulative
+Profit chart, which FreqUI normally extends to the browser's clock, is patched
+on the fly to end at replay time too.
+
+When the replay finishes, FreqUI stays up so you can browse the results. Press
+Ctrl+C to exit, or pass `--exit-when-done` to skip this (e.g. for scripted runs).
+
+FreqUI is enabled automatically when `config.json` has an `api_server` section
+with a username and password; `--no-ui` turns it off. Host port 8082 is used so
+it doesn't clash with a live bot on 8080.
+
+> FreqUI actions (force-exit, force-entry, …) act on the replay bot itself, so
+> using them changes the replay's results.
+
+### Viewing an old replay database
+
+To browse a replay database later without re-running it, start a regular
+freqtrade bot on it:
 
 ```bash
 docker run --rm -p 127.0.0.1:8080:8080 \
@@ -118,13 +149,8 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   --dry-run
 ```
 
-Then open <http://127.0.0.1:8080> and log in with the `username` / `password`
-from the `api_server` section of your `config.json`. That section must be enabled
-with `"listen_ip_address": "0.0.0.0"` so the UI is reachable from outside the container.
-
-> **Tip:** this viewer is a real dry-run bot running at the current time. Set
-> `"initial_state": "stopped"` in the config you use for viewing, so it only
-> shows the replay trades and never opens new ones.
+This viewer runs at the current time, so set `"initial_state": "stopped"` in the
+config you use for it, and its charts and open-trade lines run to today's date.
 
 ### Isolation from your live bot
 

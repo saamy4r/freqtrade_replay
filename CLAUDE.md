@@ -23,12 +23,13 @@ The output is a standard SQLite database fully compatible with FreqUI and all Fr
 ```
 freqtrade_replay/
 ├── cli.py           Entry point, argument parsing
-├── runner.py        Core orchestration: patches, main loop, summary, FreqUI config
+├── runner.py        Core orchestration: patches, main loop, summary, in-process FreqUI
 ├── clock.py         VirtualClock — wraps freezegun
 ├── exchange.py      ReplayExchange — offline OHLCV/ticker/orderbook
 ├── data_store.py    ReplayDataStore — loads feather files, serves time-gated slices
 ├── parallel.py      ParallelAnalyzer — strategy analysis on a fork()ed worker pool
 ├── compare_replays.py  Diff the trades of two replay DBs (serial vs parallel check)
+├── ui_patch.py      Serves a FreqUI copy whose browser-clock spots follow replay time
 ├── Dockerfile       FROM freqtradeorg/freqtrade:stable + freezegun + plotly + this code
 └── README.md        User-facing setup and usage docs
 ```
@@ -54,18 +55,54 @@ The `replay` service in `docker-compose.yml` (one level above `user_data/`):
 - Profile: `replay`
 - Entrypoint: the image's own `python /opt/freqtrade_replay/freqtrade_replay/cli.py`
   (dev setups override it with `/freqtrade/user_data/freqtrade_replay/cli.py`)
-- Run with: `docker compose --profile replay run --rm replay --strategy MyStrategy --timerange 20241101-20241115`
+- Ports: `127.0.0.1:8082:8080` (FreqUI live view)
+- Run with: `docker compose --profile replay run --rm --service-ports replay --strategy MyStrategy --timerange 20241101-20241115`
 
-### Viewing results in FreqUI
+### FreqUI live view
 
-There is **no** dedicated live-viewer service. A concurrent FreqUI bot was
-deliberately removed: running a viewer at real wall-clock time *during* the
-replay both pollutes the shared `tradesv3_replay.sqlite` with its own trades and
-cannot render charts for the historical (past-dated) replay trades, because its
-DataProvider only holds the current wall-clock window.
+FreqUI runs **inside the replay process** (in-process API server). Because it
+shares the replay bot's DataProvider, DB session and frozen clock, charts end at
+the current replay candle and open-trade P&L lines stop at replay time — FreqUI
+draws an open trade's line up to `data_stop_ts` of `/pair_candles`, which is the
+replay's last closed candle.
 
-To browse results, run a normal freqtrade dry-run against the replay DB **after**
-the replay finishes:
+A *separate* viewer container was removed earlier because it ran at wall-clock
+time: it polluted the replay DB with its own trades and its charts/P&L lines ran
+to today's date. Do not reintroduce that design.
+
+How the in-process UI works (`runner.py`, `_configure_ui` / `_preimport_api_server`):
+- Enabled when `config.json` has `api_server` with username/password; `--no-ui`
+  disables it. `listen_ip_address` is forced to `0.0.0.0` (container), host
+  mapping `127.0.0.1:8082:8080` lives in docker-compose (`run` needs `--service-ports`).
+- `freqtrade.rpc.api_server.*` is imported **before** `clock.start()`: modules
+  imported under freezegun bind `FakeDatetime`, and pydantic cannot build
+  response schemas for it (API server crashes on startup).
+- `clock.start(real_time_modules=("jwt", "freqtrade.rpc.api_server.api_auth"))`
+  keeps JWT issuing/validation on wall-clock time — a 15-minute token would
+  otherwise expire within a second of replay time.
+- `real_asyncio=True` is passed to freezegun when the UI is on: uvicorn runs on
+  the stdlib asyncio loop here, and with a frozen loop clock every
+  `asyncio.sleep()` hangs (shutdown never completes).
+- After the replay finishes, FreqUI keeps serving until Ctrl+C
+  (`--exit-when-done` skips this). `bot.rpc.cleanup()` in `finally` stops the
+  non-daemon uvicorn thread — without it the process never exits.
+- FreqUI actions (force-exit etc.) act on the replay bot and change results.
+- `ParallelAnalyzer` forks its pool after the API server thread has started.
+  Forked workers only copy the forking thread, so they never serve HTTP; they
+  just inherit the (unused) listening socket. The pool is closed before the
+  post-replay keep-alive wait.
+- Browser-clock spots: a few FreqUI charts use the browser's `Date.now()`, which
+  no server data can fix. Cumulative Profit appends its open-trade point at
+  `Date.now() + 1 day`, so the line ran to today. `ui_patch.py` serves a patched
+  copy of the installed FreqUI (temp dir): `Date.now()+864e5` becomes
+  `(globalThis.__replayNow?.()??Date.now())+864e5`, and `index.html` loads
+  `/replay_clock.js`, which polls `/replay_now` (virtual time, unauthenticated).
+  Its catch-all route is inserted just before freqtrade's UI router. FastAPI
+  0.14x keeps included routers as one `_IncludedRouter` entry (`original_router`),
+  so don't rely on flattened routes. If a FreqUI upgrade changes the minified
+  pattern, a warning is logged and that chart falls back to wall-clock time.
+
+To browse an old replay DB without re-running, point a normal dry-run at it:
 
 ```
 freqtrade trade --config user_data/config.json \
@@ -132,7 +169,7 @@ Subclasses `freqtrade.exchange.Exchange`. Overrides:
 6. **Patch `ExchangeResolver.load_exchange`** → returns our exchange
 7. **Patch `Worker._sleep`** → advances virtual clock instead of blocking
 8. **Patch `Wallets.record_wallet_state`** → upsert semantics (avoids UNIQUE constraint collision when multiple records share the same day-floor timestamp)
-9. **`FreqtradeBot(config)`** initialisation
+9. **`FreqtradeBot(config)`** initialisation (also starts the in-process FreqUI API server when enabled)
 10. **`_load_informative_pairs()`** — detects and loads informative pairs declared by the strategy, via `gather_informative_pairs()` so both `informative_pairs()` and `@informative`-decorated pairs are registered as markets
 11. **`ParallelAnalyzer`** (when `--workers > 1`) — forks the worker pool and replaces `strategy.analyze_pair` (see below)
 12. **Main loop** — steps at `sub_step` seconds (default 60s = 1m), calls `bot.process()` at each step; idle stretches are skipped (see below)
@@ -233,23 +270,16 @@ Funding fees were previously a known divergence but are now fully implemented us
 | `--report` | off | Write standalone HTML report (plotly equity curve + per-pair P&L) |
 | `--workers` | `os.cpu_count()` | Analysis processes; `1` = fully serial (no pool) |
 | `--no-skip-idle` | off | Run every sub-step even when idle |
+| `--no-ui` | off | Don't start the in-process FreqUI |
+| `--ui-port` | `api_server.listen_port` | Container port for FreqUI |
+| `--exit-when-done` | off | Exit after the replay instead of keeping FreqUI up |
 
 ---
 
 ## Viewing results in FreqUI
 
-The replay does not run its own FreqUI. After a run finishes, point a normal
-freqtrade dry-run at the replay DB to browse trades and charts:
-
-```
-freqtrade trade --config user_data/config.json \
-  --db-url sqlite:////freqtrade/user_data/tradesv3_replay.sqlite --dry-run
-```
-
-- Login: `username` / `password` from the `api_server` section of `config.json`
-- The viewer runs at real wall-clock time but only reads the finished replay DB,
-  so it never interferes with the replay
-- Charts for the historical trades load from the local feather data
+See "FreqUI live view" above: open http://127.0.0.1:8082 during or after a
+replay (login from `api_server` in `config.json`).
 
 ---
 
@@ -270,6 +300,6 @@ freqtrade trade --config user_data/config.json \
 - The Dockerfile copies `*.py` only. A new non-Python file the code needs must be added to the `COPY`
 - `freezegun` and `plotly` are the only extra dependencies beyond the base freqtrade image
 - `debug_validate.py` contains a `ReplayDebugStrategy` for validating harness behaviour
-- Do not add `api_server` to the config passed to `FreqtradeBot` in `runner.py` — it is explicitly popped to avoid spawning an API server inside the replay container
-- Do not add `telegram` to that config either — same reason
+- `api_server` is kept in the config passed to `FreqtradeBot` only when the UI is enabled (see "FreqUI live view"); with `--no-ui` it is popped
+- Do not add `telegram` to that config — it is popped so a replay never sends notifications
 - The `Wallets.record_wallet_state` patch uses SQLite `INSERT OR REPLACE` (upsert) semantics because freqtrade floors wallet timestamps to the day, causing UNIQUE collisions when the replay processes multiple candles in the same calendar day

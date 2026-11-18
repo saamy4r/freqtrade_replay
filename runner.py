@@ -29,8 +29,67 @@ from .clock import VirtualClock
 from .data_store import TIMEFRAMES, ReplayDataStore, feather_name
 from .exchange import ReplayExchange
 from .parallel import ParallelAnalyzer
+from .ui_patch import install_replay_ui
 
 logger = logging.getLogger(__name__)
+
+
+# Module prefixes that keep wall-clock time while the virtual clock is frozen.
+# FreqUI's JWT access tokens live 15 minutes; under virtual time (days per
+# wall second) they would expire immediately and FreqUI would keep logging out.
+# (The asyncio event loop clock is handled separately via real_asyncio.)
+_UI_REAL_TIME_MODULES = ("jwt", "freqtrade.rpc.api_server.api_auth")
+
+
+def _configure_ui(config: dict, enabled: bool, port: int | None) -> str | None:
+    """Enable freqtrade's API server (FreqUI) inside the replay process.
+
+    Returns the URL to log, or None when the UI is off.  Reuses the
+    credentials from the config's api_server section.
+    """
+    api = config.get("api_server")
+    if not enabled:
+        config.pop("api_server", None)
+        return None
+    if not api or not api.get("username") or not api.get("password"):
+        logger.warning(
+            "No api_server username/password in config — FreqUI live view disabled. "
+            "Add an api_server section to enable it, or pass --no-ui to silence this."
+        )
+        config.pop("api_server", None)
+        return None
+    api["enabled"] = True
+    # Listen on all interfaces: inside Docker, loopback is unreachable from
+    # the host; exposure is controlled by the compose port mapping instead.
+    api["listen_ip_address"] = "0.0.0.0"
+    if port is not None:
+        api["listen_port"] = port
+    api.setdefault("listen_port", 8080)
+    return (
+        f"container port {api['listen_port']} "
+        "(host: http://127.0.0.1:8082 with the default docker-compose mapping)"
+    )
+
+
+def _preimport_api_server() -> None:
+    """Import every freqtrade API server module before freezegun starts.
+
+    Modules imported while time is frozen bind `datetime` to freezegun's
+    FakeDatetime, and pydantic cannot build response schemas for it (the
+    API server crashes at startup).  Imported beforehand, the schemas are
+    built against the real class; FakeDatetime values still validate since
+    FakeDatetime subclasses datetime.
+    """
+    import importlib
+    import pkgutil
+
+    import freqtrade.rpc.api_server as api_pkg
+
+    for mod in pkgutil.walk_packages(api_pkg.__path__, api_pkg.__name__ + "."):
+        try:
+            importlib.import_module(mod.name)
+        except Exception as exc:  # optional extras (e.g. backtest deps) may be absent
+            logger.debug("Could not pre-import %s: %s", mod.name, exc)
 
 
 def _drop_db(db_url: str) -> None:
@@ -270,6 +329,9 @@ def run_replay(
     sub_step: int = 60,
     workers: int = 1,
     skip_idle: bool = True,
+    ui: bool = True,
+    ui_port: int | None = None,
+    exit_when_done: bool = False,
 ) -> None:
     pairs = _normalise_pairs(pairs)
 
@@ -296,7 +358,7 @@ def run_replay(
 
     # Disable all notification channels (remove rather than disable to skip schema validation)
     config.pop("telegram", None)
-    config.pop("api_server", None)
+    ui_url = _configure_ui(config, ui, ui_port)
 
     # Resolve the strategy now so its `timeframe` and `startup_candle_count`
     # populate the config.  freqtrade precedence: an explicit config value wins,
@@ -367,8 +429,11 @@ def run_replay(
     # After clock.start() every time.* call returns frozen virtual time.
     _wall_clock = time.monotonic
 
+    if ui_url:
+        _preimport_api_server()
+
     clock = VirtualClock()
-    clock.start(data_start)
+    clock.start(data_start, real_time_modules=_UI_REAL_TIME_MODULES if ui_url else ())
 
     # ------------------------------------------------------------------ #
     # 4. Build ReplayExchange                                               #
@@ -475,12 +540,22 @@ def run_replay(
     Wallets.record_wallet_state = _upsert_record_wallet_state
 
     analyzer: ParallelAnalyzer | None = None
+    bot = None
+    patched_ui_dir = None
     try:
         # ---------------------------------------------------------------- #
         # 7. Initialise FreqtradeBot                                         #
         # ---------------------------------------------------------------- #
+        # With api_server in the config, this also starts FreqUI in a thread
+        # of this process: it serves the replay's own DataProvider, DB and
+        # virtual clock, so charts and open-trade P&L stop at replay time.
         bot = FreqtradeBot(config)
         bot.state = State.RUNNING  # Worker normally does this; we bypass Worker
+        if ui_url:
+            # Patch the browser-clock spots in FreqUI (Cumulative Profit's
+            # open-trade point) to use replay time.
+            patched_ui_dir = install_replay_ui(bot, clock)
+            logger.info("FreqUI live view on %s — log in with the api_server credentials", ui_url)
 
         # Load informative pairs declared by the strategy (e.g. BTC as a filter).
         # These are not in the user's --pairs list so the store doesn't have them yet.
@@ -597,16 +672,37 @@ def run_replay(
         # 9. Summary                                                         #
         # ---------------------------------------------------------------- #
         _print_summary(db_url, report_path=report_path)
-        print(
-            "  View results: point a freqtrade dry-run at the replay DB, e.g.\n"
-            "    freqtrade trade --config user_data/config.json "
-            "--db-url sqlite:////freqtrade/user_data/tradesv3_replay.sqlite --dry-run"
-        )
-        print()
+        if ui_url and not exit_when_done:
+            # Keep the in-process FreqUI up so the finished replay can be
+            # browsed with the clock frozen at the replay's end time.  The
+            # analysis pool is no longer needed; don't hold its processes.
+            if analyzer is not None:
+                analyzer.close()
+                analyzer = None
+            print(f"  Replay finished. FreqUI still serving on {ui_url} — Ctrl+C to exit.")
+            print(flush=True)  # stdout is block-buffered under docker
+            try:
+                while True:
+                    time.sleep(3600)  # freezegun does not patch sleep
+            except KeyboardInterrupt:
+                pass
+        elif not ui_url:
+            print(
+                "  View results: point a freqtrade dry-run at the replay DB, e.g.\n"
+                "    freqtrade trade --config user_data/config.json "
+                "--db-url sqlite:////freqtrade/user_data/tradesv3_replay.sqlite --dry-run"
+            )
+            print()
 
     finally:
         if analyzer is not None:
             analyzer.close()
+        if bot is not None:
+            # Stops the uvicorn thread; it is non-daemon, so without this the
+            # process would hang after the replay ends or on Ctrl+C.
+            bot.rpc.cleanup()
+        if patched_ui_dir is not None:
+            shutil.rmtree(patched_ui_dir, ignore_errors=True)
         ExchangeResolver.load_exchange = original_load_exchange
         Worker._sleep = original_sleep
         Wallets.record_wallet_state = original_record_wallet_state

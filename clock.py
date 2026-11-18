@@ -23,11 +23,25 @@ class VirtualClock:
         self._frozen = None
         self._current: datetime | None = None
 
-    def start(self, start_dt: datetime) -> None:
+    def start(self, start_dt: datetime, real_time_modules: tuple[str, ...] = ()) -> None:
+        """Freeze time at start_dt.
+
+        real_time_modules: module-name prefixes that keep seeing wall-clock
+        time (freezegun's `ignore`).  Used for the in-process FreqUI server,
+        whose JWT tokens must expire in real minutes, not virtual ones —
+        otherwise a 15-minute token dies within a second of replay time.
+        """
         if start_dt.tzinfo is None:
             start_dt = start_dt.replace(tzinfo=timezone.utc)
         self._current = start_dt
-        self._freeze_ctx = freeze_time(start_dt)
+        # real_asyncio: asyncio event loops (uvicorn's) keep a real monotonic
+        # clock, otherwise every asyncio.sleep()/timeout in the API server
+        # thread waits for virtual time and its shutdown hangs forever.
+        self._freeze_ctx = freeze_time(
+            start_dt,
+            ignore=list(real_time_modules),
+            real_asyncio=bool(real_time_modules),
+        )
         self._frozen = self._freeze_ctx.start()
 
     def advance_to(self, dt: datetime) -> None:
