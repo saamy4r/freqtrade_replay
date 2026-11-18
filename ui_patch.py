@@ -92,6 +92,32 @@ def _ui_endpoints(web_ui) -> tuple:
     return (web_ui.index_html, *(getattr(web_ui, n) for n in _UI_SPECIAL.values()))
 
 
+def _patch_ws_serializer() -> None:
+    """Let FreqUI's websocket serialize freezegun's FakeDatetime.
+
+    orjson only serializes exact `datetime` instances, not subclasses, so every
+    websocket message carrying a timestamp (trade entry/exit events, ...)
+    raised "Type is not JSON serializable: FakeDatetime" and dropped the
+    connection, which stopped live updates.  The fallback encoder now emits the
+    same ISO-8601 string orjson would produce for a real datetime.
+    """
+    from datetime import date
+
+    from freqtrade.rpc.api_server.ws import serializer
+
+    original = serializer._json_default
+    if getattr(original, "_replay_patched", False):
+        return
+
+    def _json_default(z):
+        if isinstance(z, date):  # datetime is a date subclass
+            return z.isoformat()
+        return original(z)
+
+    _json_default._replay_patched = True
+    serializer._json_default = _json_default  # looked up at call time
+
+
 def install_replay_ui(bot, clock) -> Path | None:
     """Serve a replay-time-aware FreqUI from the bot's in-process API server.
 
@@ -109,6 +135,7 @@ def install_replay_ui(bot, clock) -> Path | None:
     server = next((m for m in bot.rpc.registered_modules if isinstance(m, ApiServer)), None)
     if server is None:
         return None
+    _patch_ws_serializer()
     src = Path(web_ui.__file__).parent / "ui" / "installed"
     if not (src / "index.html").is_file():
         logger.warning("FreqUI is not installed in this image — nothing to patch.")

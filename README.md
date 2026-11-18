@@ -101,6 +101,7 @@ Add any of these after the image name, or after `replay` with Compose:
 | `--no-ui` | off | Don't start the FreqUI live view |
 | `--ui-port` | `api_server.listen_port` | Port of the FreqUI live view inside the container |
 | `--exit-when-done` | off | Exit when the replay finishes instead of keeping FreqUI up |
+| `--keep-open` | off | Leave trades still open at the end open (default: close them at the end-time price, `exit_reason` `force_exit`) |
 
 Paths are paths inside the container, where your `user_data` folder is
 `/freqtrade/user_data`. For example, to get an HTML report in your `user_data`

@@ -87,6 +87,11 @@ How the in-process UI works (`runner.py`, `_configure_ui` / `_preimport_api_serv
   (`--exit-when-done` skips this). `bot.rpc.cleanup()` in `finally` stops the
   non-daemon uvicorn thread — without it the process never exits.
 - FreqUI actions (force-exit etc.) act on the replay bot and change results.
+- Websocket: orjson only serializes exact `datetime`, not freezegun's
+  `FakeDatetime` subclass, so every pushed trade event failed and dropped the
+  connection (no live updates). `ui_patch._patch_ws_serializer` wraps
+  `ws.serializer._json_default` to emit `isoformat()`, which is the same string
+  orjson writes for a real datetime.
 - `ParallelAnalyzer` forks its pool after the API server thread has started.
   Forked workers only copy the forking thread, so they never serve HTTP; they
   just inherit the (unused) listening socket. The pool is closed before the
@@ -173,8 +178,9 @@ Subclasses `freqtrade.exchange.Exchange`. Overrides:
 10. **`_load_informative_pairs()`** — detects and loads informative pairs declared by the strategy, via `gather_informative_pairs()` so both `informative_pairs()` and `@informative`-decorated pairs are registered as markets
 11. **`ParallelAnalyzer`** (when `--workers > 1`) — forks the worker pool and replaces `strategy.analyze_pair` (see below)
 12. **Main loop** — steps at `sub_step` seconds (default 60s = 1m), calls `bot.process()` at each step; idle stretches are skipped (see below)
-13. **Summary + HTML report** (optional)
-14. **Restore all patches** (and shut down the pool) in `finally` block
+13. **`_close_open_trades()`** — unless `--keep-open`: moves the clock to `end_dt` and force-exits all open trades through freqtrade's RPC force-exit with market orders (`exit_reason` `force_exit`, like backtesting's end-of-data close). `confirm_trade_exit` is bypassed for these exits, since freqtrade asks it even on force exits and a strategy could refuse
+14. **Summary + HTML report** (optional)
+15. **Restore all patches** (and shut down the pool) in `finally` block
 
 ### `parallel.py` — ParallelAnalyzer (multi-core)
 
@@ -273,6 +279,7 @@ Funding fees were previously a known divergence but are now fully implemented us
 | `--no-ui` | off | Don't start the in-process FreqUI |
 | `--ui-port` | `api_server.listen_port` | Container port for FreqUI |
 | `--exit-when-done` | off | Exit after the replay instead of keeping FreqUI up |
+| `--keep-open` | off | Don't force-exit trades still open at the end |
 
 ---
 

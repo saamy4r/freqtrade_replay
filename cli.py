@@ -148,6 +148,12 @@ def main() -> None:
              "for browsing the results.",
     )
 
+    p.add_argument(
+        "--keep-open", action="store_true",
+        help="Leave trades that are still open at the end of the replay open, instead "
+             "of force-exiting them at the end-time price (exit_reason force_exit).",
+    )
+
     args = p.parse_args()
     if args.workers < 1:
         p.error("--workers must be >= 1")
@@ -183,6 +189,7 @@ def main() -> None:
         ui=not args.no_ui,
         ui_port=args.ui_port,
         exit_when_done=args.exit_when_done,
+        close_open_trades=not args.keep_open,
     )
 
 

@@ -332,6 +332,7 @@ def run_replay(
     ui: bool = True,
     ui_port: int | None = None,
     exit_when_done: bool = False,
+    close_open_trades: bool = True,
 ) -> None:
     pairs = _normalise_pairs(pairs)
 
@@ -669,6 +670,12 @@ def run_replay(
                 current = next_step
 
         # ---------------------------------------------------------------- #
+        # 8b. Close whatever is still open at the end of the replay          #
+        # ---------------------------------------------------------------- #
+        if close_open_trades:
+            _close_open_trades(bot, clock, end_dt)
+
+        # ---------------------------------------------------------------- #
         # 9. Summary                                                         #
         # ---------------------------------------------------------------- #
         _print_summary(db_url, report_path=report_path)
@@ -707,6 +714,43 @@ def run_replay(
         Worker._sleep = original_sleep
         Wallets.record_wallet_state = original_record_wallet_state
         clock.stop()
+
+
+def _close_open_trades(bot, clock: VirtualClock, end_dt: datetime) -> None:
+    """Force-exit every open trade at the replay's end time.
+
+    Like freqtrade backtesting's end-of-data close, so results contain only
+    closed trades (exit_reason "force_exit").  Goes through freqtrade's own
+    RPC force-exit (the same path as FreqUI's "Force exit all"): open entry
+    orders are cancelled, open exit orders replaced, and a market exit is
+    placed at the end-time price.  Market orders fill immediately in dry-run.
+
+    The strategy's confirm_trade_exit is bypassed for these exits: freqtrade
+    calls it even for force exits, and a strategy that rejects (e.g. "never
+    exit below X") would otherwise leave trades open after the replay.
+    """
+    clock.advance_to(end_dt)
+    n_open = len(Trade.get_open_trades())
+    if n_open == 0:
+        return
+    logger.info("Replay end: closing %d open trade(s) at %s", n_open, end_dt)
+
+    strategy = bot.strategy
+    original_confirm = strategy.confirm_trade_exit
+    strategy.confirm_trade_exit = lambda *args, **kwargs: True
+    try:
+        bot.rpc._rpc._rpc_force_exit("all", ordertype="market")
+    except Exception as exc:
+        logger.warning("Closing open trades at replay end failed: %s", exc, exc_info=True)
+    finally:
+        strategy.confirm_trade_exit = original_confirm
+
+    still_open = Trade.get_open_trades()
+    if still_open:
+        logger.warning(
+            "%d trade(s) could not be closed at replay end: %s",
+            len(still_open), ", ".join(f"{t.pair} (id {t.id})" for t in still_open),
+        )
 
 
 def _is_idle(bot) -> bool:
